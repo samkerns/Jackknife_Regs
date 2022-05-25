@@ -1,0 +1,283 @@
+---
+title: "Client, Subsampled Regressions"
+author: "Sam Kerns"
+date: "5/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, style = "asis"}
+knitr::opts_chunk$set(echo = TRUE)
+##Loading requisite libraries
+library(tidyverse)
+library(survey)
+library(jtools)
+library(glue)
+library(rlang)
+library(haven)
+library(knitr)
+##Clearing memory on re-run
+rm(list = ls())
+```
+
+# Regressions using Jackknife SE Estimation.
+
+The following markdown document will highlight two separate techniques: using analytic weights in a large, public survey (ECLS-K) to weight regressions, and calculating standard error estimates via a balanced repeated replication (BRR), jackknife method. Additionally, this document will allow the reader to view the source code, written in R, that is used to produce the regressions and calculate the standard errors. 
+
+Each block of code will be accompanied by comments (starting with a double hash) that summarize the intention of the code as well as a brief interpretation of the results.
+```{r}
+##Reading the data in from my local device, setting file paths
+data_dir <- "/home/sam/Downloads"
+out_dir <- "/home/sam/Desktop/FNF Research Consulting/Dissertation Support/Client Dissert. Support"
+ECLS <- read_sav(glue("{data_dir}/Data Set.sav"))
+```
+
+The block of code above is designed to simply set up file paths for the data read in and outputs. Additionally, the ECLS-K data are being read in here.
+
+```{r}
+##Reducing the data frame to only the needed variable and dropping the full ECLS-K
+ECLS_reduced <- ECLS %>%
+  select(c(CHILDID,
+           starts_with("W12P"), 
+           ends_with("SCALK5"), 
+           ends_with("TCHCON"), 
+           ends_with("TCHPER"), 
+           ends_with("TCHEXT"), 
+           ends_with("TCHINT"),
+           X_BLACK_R,
+           X_WHITE_R,
+           X9POVTY_I)) %>%
+  select(-c(starts_with("W12P0S"),
+            starts_with("W12P0P"),
+            starts_with("W12PZ"),)) %>%
+  mutate(X9POVTY_I = case_when(X9POVTY_I == 2 | X9POVTY_I == 3 ~ 1,
+                               TRUE ~ 0)) %>%
+  mutate_all(., as.numeric)
+ECLS_scaled <- data.frame(scale(ECLS_reduced))
+##Dropping original ECLS data frame
+rm(ECLS)
+##Saving analytic data frame
+write.csv(ECLS_reduced, glue("{out_dir}/analytic_data.csv"), row.names = F)
+```
+
+The code above is designed to reduce the size of the data set and, in doing so, to ensure that program runs as swiftly as possible. This will ensure efficient run times if replication or iteration are necessary. Additionally, the code removes the original dataset from memory to free up space and writes out a copy of the analytic dataset for future use.
+
+Next, we'll right a function that allows us to reduce the data frame based on a series of options. This will allow us to run the regressions swiftly and to be explicit about the results at each level.
+```{r}
+##Creating scales for jackknife method
+wgt_n <- length(ECLS_reduced$CHILDID)
+eclsk_rscales  <-wgt_n/(wgt_n-1)
+```
+
+```{r}
+##Writing function to reduce dataframe and execute regressions, outputs
+reg_func <- function(df, i, x, y){
+  
+  ##Creating the target analytic data frame
+  df1 <- df %>%
+    select(c(starts_with("W12P"),
+             ##Use this for waves (X2 = K, X4 = 1, X6 = 2, X7 = 3, X8 = 4, X9 = 5)
+             starts_with(glue("X{i}TCH")),
+             ##x is the race targeted - X_BLACK_R | X_WHITE_R
+             !!parse_expr(glue("{x}")),
+             ##y is the skill targeted
+             !!parse_expr(glue("{y}")),                            
+             X9POVTY_I)) %>%
+    ##Filtering based on race and poverty levels
+    filter(!!parse_expr(glue("{x}")) == 1 & X9POVTY_I == 1) %>%
+    ##Dropping the race/poverty vars after filtering
+    select(-c(!!parse_expr(glue("{x}")), X9POVTY_I)) %>%
+    ##Dropping any rows with missing data
+    na.omit(.)                                                     
+  
+  ##Creating the jackknife method
+  BRR_design <- svrepdesign(data = df1,
+                            ##Based on approach, BRR weights will remain in the same position in data frame
+                            repweights = df1[,7:86],               
+                            combined.weights = T,
+                            type = "JK1", 
+                            weights = ~df1$W12P0,
+                            scale = 1)
+  ##Running the model
+  model <- svyglm(formula = as.formula(glue("{y} ~ X{i}TCHCON + X{i}TCHPER + X{i}TCHEXT + X{i}TCHINT")), 
+         design = BRR_design,
+         family = "gaussian")
+  
+  ##Calculating Model Summary with Confidence intervals
+  CI <- summ(model, confint = getOption("summ-confint", TRUE), digits = getOption("jtools-digits", default = 3))
+  CI2 <- summ(model, digits = getOption("jtools-digits", default = 3))
+  ##Calculating F-ratio for the models
+  F_test <- regTermTest(model, as.formula(glue("~ X{i}TCHCON + X{i}TCHPER + X{i}TCHEXT + X{i}TCHIN")))
+  F_results <- round(data.frame(Fval = F_test$Ftest, df = F_test$df, ddf = F_test$ddf, pval = F_test$p), 3)
+  
+  ##Running the standardized model
+  model2 <- svyglm(formula = as.formula(glue("scale({y}) ~ scale(X{i}TCHCON) + scale(X{i}TCHPER) + scale(X{i}TCHEXT) + scale(X{i}TCHINT)")), 
+         design = BRR_design,
+         family = "gaussian")
+  
+  ##Calculating Model Summary with Confidence intervals
+  std <- round(summary(model2)$coefficients, 3)
+  
+  return(list(CI, CI2, F_results, std))
+}
+```
+
+Now that we've created this function to handle the production of all your relevant outputs, let's start to look at the various combinations of race, poverty, and grade. For your reference, here are how the code blocks below function:
+
+[[1]] = Regression Model Outputs with 95% CIs and R values
+[[2]] = Regression incl. SE values for population in Tables
+[[3]] = F, Degrees of Freedom and p-value from ANOVA
+[[4]] = Standardized Coefficients
+
+All of the regressions below are evaluated for students in poverty 
+
+# Reading Regressions
+
+### Kindergarten, Black, Reading
+```{r, warning=F}
+##Running the function on the Kindergarten, reading students
+reg_func(df = ECLS_reduced, i = 2, x = "X_BLACK_R", y = "X2RSCALK5")
+```
+
+### Write up to use as model - interpreting the tables above
+Results of the multiple linear regression indicated that there was a significant association between teacher-reported social skills and IRT reading scores for black kindergarten students in high poverty (F(3, 74) = 3.215, p =0.028). When examining individual predictors, teacher-reported self-control (B = 1.289, p = .653), teacher-reported externalizing behaviors (B = 1.299, p = 0.554), and teacher-reported internalizing problem behaviors (B = -2.712, p = 0.149) were not found to be statistically significant predictors in the model. Teacher-reported interpersonal skills, however, did demonstrate statistical significance (B = 4.407, p = 0.040). Furthermore the teacher-reported interpersonal skills predictor demonstrated the strongest performance in the model (standardized B = 0.192).
+
+
+### Kindergarten, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 2, x = "X_WHITE_R", y = "X2RSCALK5")
+```
+
+### First Grade, Black, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 4, x = "X_BLACK_R", y = "X4RSCALK5")
+```
+
+### First Grade, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 4, x = "X_WHITE_R", y = "X4RSCALK5")
+```
+
+### Second Grade, Black, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 6, x = "X_BLACK_R", y = "X6RSCALK5")
+```
+
+### Second Grade, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 6, x = "X_WHITE_R", y = "X6RSCALK5")
+```
+
+### Third Grade, Black, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 7, x = "X_BLACK_R", y = "X7RSCALK5")
+```
+
+### Third Grade, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 7, x = "X_WHITE_R", y = "X7RSCALK5")
+```
+
+### Fourth Grade, Black, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 8, x = "X_BLACK_R", y = "X8RSCALK5")
+```
+
+### Fourth Grade, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 8, x = "X_WHITE_R", y = "X8RSCALK5")
+```
+
+### Fifth Grade, Black, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 9, x = "X_BLACK_R", y = "X9RSCALK5")
+```
+
+### Fifth Grade, White, Reading
+```{r, warning = F}
+##Running the function on the Kindergarten, reading students
+reg_func(ECLS_reduced, i = 9, x = "X_WHITE_R", y = "X9RSCALK5")
+```
+
+# Mathematics Regressions
+
+### Kindergarten, Black, Math
+```{r, warning=F}
+##Running the function on the Kindergarten, Math students
+reg_func(df = ECLS_reduced, i = 2, x = "X_BLACK_R", y = "X2MSCALK5")
+```
+
+### Kindergarten, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 2, x = "X_WHITE_R", y = "X2MSCALK5")
+```
+
+### First Grade, Black, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 4, x = "X_BLACK_R", y = "X4MSCALK5")
+```
+
+### First Grade, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 4, x = "X_WHITE_R", y = "X4MSCALK5")
+```
+
+### Second Grade, Black, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 6, x = "X_BLACK_R", y = "X6MSCALK5")
+```
+
+### Second Grade, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 6, x = "X_WHITE_R", y = "X6MSCALK5")
+```
+
+### Third Grade, Black, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 7, x = "X_BLACK_R", y = "X7MSCALK5")
+```
+
+### Third Grade, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 7, x = "X_WHITE_R", y = "X7MSCALK5")
+```
+
+### Fourth Grade, Black, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 8, x = "X_BLACK_R", y = "X8MSCALK5")
+```
+
+### Fourth Grade, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 8, x = "X_WHITE_R", y = "X8MSCALK5")
+```
+
+### Fifth Grade, Black, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 9, x = "X_BLACK_R", y = "X9MSCALK5")
+```
+
+### Fifth Grade, White, Math
+```{r, warning = F}
+##Running the function on the Kindergarten, Math students
+reg_func(ECLS_reduced, i = 9, x = "X_WHITE_R", y = "X9MSCALK5")
+```
